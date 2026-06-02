@@ -368,25 +368,64 @@ function handleDrop(e) {
   if (file) handleFile(file);
 }
 
-// ── Fetch GitHub README ───────────────────────────────────────────────────────
-async function fetchGitHubReadme(url) {
-  // Extract owner/repo from URL
+// ── Fetch GitHub repo contents ────────────────────────────────────────────────
+async function fetchGitHubRepo(url) {
   const match = url.match(/github\.com\/([^/]+)\/([^/?\s]+)/);
   if (!match) throw new Error("Invalid GitHub URL. Use: https://github.com/username/repo");
   const [, owner, repo] = match;
 
-  // Try README.md first, then readme.md, then README
-  const candidates = ["README.md", "readme.md", "README.rst", "README.txt", "README"];
-  for (const file of candidates) {
-    const raw = `https://raw.githubusercontent.com/${owner}/${repo}/main/${file}`;
-    const res = await fetch(raw);
-    if (res.ok) return await res.text();
-    // Try master branch
-    const rawMaster = `https://raw.githubusercontent.com/${owner}/${repo}/master/${file}`;
-    const res2 = await fetch(rawMaster);
-    if (res2.ok) return await res2.text();
+  // Detect default branch
+  let branch = "main";
+  const branchTest = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/main/`);
+  if (!branchTest.ok) branch = "master";
+
+  const rawBase = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}`;
+
+  // Fetch repo file tree via GitHub API
+  let tree = [];
+  try {
+    const treeRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`);
+    if (treeRes.ok) {
+      const treeData = await treeRes.json();
+      tree = (treeData.tree || []).filter(f => f.type === "blob").map(f => f.path);
+    }
+  } catch(e) {}
+
+  // Priority files to fetch
+  const priority = [
+    "README.md","readme.md","README.txt","README.rst",
+    "main.py","app.py","index.py","run.py","server.py","cli.py",
+    "index.js","index.ts","app.js","app.ts","server.js","main.js",
+    "orchestrator.py","gui.py","requirements.txt","package.json",
+    "Makefile","docker-compose.yml",".env.example"
+  ];
+
+  // Build fetch list: priority files first, then any .py/.js/.ts up to limit
+  const toFetch = [];
+  priority.forEach(f => { if (tree.includes(f)) toFetch.push(f); });
+  tree.forEach(f => {
+    if (toFetch.length >= 12) return;
+    if (/\.(py|js|ts|go|rb|rs|java)$/.test(f) && !toFetch.includes(f)) toFetch.push(f);
+  });
+
+  // Fetch all files, concatenate
+  const parts = [];
+  let totalChars = 0;
+  for (const file of toFetch) {
+    if (totalChars >= 8000) break;
+    try {
+      const res = await fetch(`${rawBase}/${file}`);
+      if (res.ok) {
+        const text = await res.text();
+        const snippet = text.slice(0, 1500);
+        parts.push(`\n\n=== ${file} ===\n${snippet}`);
+        totalChars += snippet.length;
+      }
+    } catch(e) {}
   }
-  throw new Error("Could not find a README in this repo. Make sure it's public.");
+
+  if (parts.length === 0) throw new Error("Could not read any files. Make sure the repo is public.");
+  return parts.join("");
 }
 
 // ── Claude API call ───────────────────────────────────────────────────────────
@@ -458,7 +497,7 @@ async function generate() {
     if (activeTab === "github") {
       const url = document.getElementById("github-url").value.trim();
       if (!url) throw new Error("Paste a GitHub URL first.");
-      projectContent = await fetchGitHubReadme(url);
+      projectContent = await fetchGitHubRepo(url);
     } else {
       if (!uploadedContent) throw new Error("Upload a README file first.");
       projectContent = uploadedContent;
